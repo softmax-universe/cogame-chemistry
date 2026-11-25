@@ -447,7 +447,11 @@
       "image": "{{CHEMISTRY_IMAGE}}",
       "run": [
         "/bin/chemistry-player"
-      ]
+      ],
+      "env": {
+        "COWORLD_LLM_ENABLED": "true",
+        "COWORLD_LLM_MODEL": "anthropic/claude-haiku-4.5"
+      }
     },
     {
       "id": "chemistry-courier",
@@ -683,7 +687,7 @@
         "player_id": "chemistry-courier"
       },
       {
-        "player_id": "chemistry-player"
+        "player_id": "chemistry-courier"
       },
       {
         "player_id": "chemistry-courier"
