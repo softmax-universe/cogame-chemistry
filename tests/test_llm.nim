@@ -105,7 +105,7 @@ suite "the reply schema":
     check validateUtf8(order.notes) == -1
 
 suite "no fallbacks: reject and record missed turns":
-  test "with no credentials unscripted seats miss their turn without fallback":
+  test "with no credentials unscripted seats flag infrastructure failure without fallback":
     delEnv("COWORLD_LLM_ENDPOINT")
     delEnv("AWS_ENDPOINT_URL_BEDROCK_RUNTIME")
     delEnv("AWS_BEARER_TOKEN_BEDROCK")
@@ -121,10 +121,11 @@ suite "no fallbacks: reject and record missed turns":
     for slot in 0 ..< Seats:
       check not decisions[slot].hasOrder
       check decisions[slot].status == asMissing
+      check decisions[slot].infraFailure
 
-  test "a dead transport rejects and marks missed turns without substituting an order":
-    ## A closed port on localhost is a transport that fails immediately: the
-    ## same path a timeout, a 429, a 403 or a junk body takes.
+  test "a dead transport flags infrastructure failure without substituting an order":
+    ## A closed port on localhost is a transport outage (distinct from a valid
+    ## HTTP 200 invalid model reply).
     putEnv("AWS_ENDPOINT_URL_BEDROCK_RUNTIME", "http://127.0.0.1:9/bedrock")
     putEnv("AWS_BEARER_TOKEN_BEDROCK", "not-a-real-token")
     defer:
@@ -143,6 +144,7 @@ suite "no fallbacks: reject and record missed turns":
     for slot in 0 ..< Seats:
       check not decisions[slot].hasOrder
       check decisions[slot].status == asRejected
+      check decisions[slot].infraFailure
       check decisions[slot].error.len > 0
 
   test "scripted seats never enter the batch":

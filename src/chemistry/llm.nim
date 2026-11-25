@@ -33,6 +33,8 @@ const
   BedrockAnthropicVersion = "bedrock-2023-05-31"
 
 type
+  ChemistryInfraError* = object of ChemistryError
+
   LlmTransport = enum
     ltNone, ltSidecar, ltBedrock, ltAnthropic
 
@@ -57,6 +59,7 @@ type
     order*: Order
     status*: ActionStatus
     error*: string
+    infraFailure*: bool
 
 proc resolveApiKey(): string =
   result = getEnv("ANTHROPIC_API_KEY").strip()
@@ -646,9 +649,15 @@ proc requestFor(client: LlmClient, system, user: string, slot: int):
   result.headers = headers
   result.body = $body
 
+proc isTimeoutError(error: string): bool =
+  let lower = error.toLowerAscii()
+  "timed out" in lower or "timeout" in lower
+
 proc textOf(client: LlmClient, response: Response, error, url: string): string =
   if error.len > 0:
-    raise newException(ChemistryError, "llm transport: " & errorText(error))
+    if isTimeoutError(error):
+      raise newException(ChemistryError, "llm timeout: " & errorText(error))
+    raise newException(ChemistryInfraError, "llm transport: " & errorText(error))
   if response.code == 401 or response.code == 403:
     let detail = response.body[0 .. min(response.body.high, 400)]
     if "Model access is denied" in response.body and
@@ -656,15 +665,15 @@ proc textOf(client: LlmClient, response: Response, error, url: string): string =
       raise newException(ChemistryError,
         "bedrock model access denied: " & errorText(detail))
     client.disabled = true
-    raise newException(ChemistryError,
+    raise newException(ChemistryInfraError,
       "llm auth failed (" & $response.code & ") at " & url & ": " &
       errorText(detail))
   if response.code == 429:
     let detail = response.body[0 .. min(response.body.high, 300)]
-    raise newException(ChemistryError, "llm throttled (429): " &
+    raise newException(ChemistryInfraError, "llm throttled (429): " &
       errorText(detail))
   if response.code < 200 or response.code >= 300:
-    raise newException(ChemistryError, "anthropic error " & $response.code &
+    raise newException(ChemistryInfraError, "llm provider error " & $response.code &
       ": " & errorText(response.body[0 .. min(response.body.high, 300)]))
   let payload = parseJson(response.body)
   if payload{"stop_reason"}.getStr() == "refusal":
@@ -696,6 +705,7 @@ proc decideAll*(
   if capture: client.nativeAttempts = newSeq[seq[DecisionAttempt]](Seats)
   var open: seq[int]
   var lastErrors = newSeq[string](Seats)
+  var infraErrors = newSeq[string](Seats)
   for slot in 0 ..< Seats:
     if skip.len == Seats and skip[slot]:
       result[slot] = SeatDecision(hasOrder: false, status: asMissing,
@@ -712,7 +722,7 @@ proc decideAll*(
         error: "seat disconnected")
     elif client.disabled:
       result[slot] = SeatDecision(hasOrder: false, status: asMissing,
-        error: "no LLM credentials")
+        error: "no LLM credentials configured", infraFailure: true)
     else:
       open.add slot
   client.lastBatchSize = open.len
@@ -762,18 +772,32 @@ proc decideAll*(
           hasOrder: true,
           order: order,
           status: asAccepted)
+      except ChemistryInfraError as error:
+        if capture: evidence.rejectionReason = some(error.msg)
+        lastErrors[slot] = errorText(error.msg)
+        infraErrors[slot] = lastErrors[slot]
+        echo "chemistry llm: seat ", slot, " attempt ", attempt, " infra error: ",
+          lastErrors[slot]
+        stillOpen.add slot
       except CatchableError as error:
         if capture: evidence.rejectionReason = some(error.msg)
         lastErrors[slot] = errorText(error.msg)
+        infraErrors[slot] = ""
         echo "chemistry llm: seat ", slot, " attempt ", attempt, " failed: ",
           lastErrors[slot]
         stillOpen.add slot
       if capture: client.nativeAttempts[slot].add(evidence)
     open = stillOpen
   for slot in open:
-    echo "chemistry llm: seat ", slot, " missed turn (no fallback): ",
-      lastErrors[slot]
+    let isInfra = infraErrors[slot].len > 0 or client.disabled
+    if isInfra:
+      echo "chemistry llm: seat ", slot, " infrastructure failure: ",
+        lastErrors[slot]
+    else:
+      echo "chemistry llm: seat ", slot, " missed turn (no fallback): ",
+        lastErrors[slot]
     result[slot] = SeatDecision(
       hasOrder: false,
       status: (if lastErrors[slot].len > 0: asRejected else: asMissing),
-      error: lastErrors[slot])
+      error: lastErrors[slot],
+      infraFailure: isInfra)

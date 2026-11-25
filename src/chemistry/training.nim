@@ -131,3 +131,16 @@ proc finishNativeTrajectory*(trajectory: DecisionTrajectory, game: Sim) =
   trajectory.finish(if outcome["reason"].getStr() == "complete": esCompleted else: esTruncated,
     outcome, scores)
   trajectory.writeEventsToUri(getEnv(CogameSaveTrajectoryUriEnv))
+
+proc finishFailedNativeTrajectory*(trajectory: DecisionTrajectory, kind,
+    reason: string, seat, shift: int) =
+  if trajectory.isNil: return
+  let outcome = %*{
+    "kind": kind,
+    "error": reason,
+    "seat": seat,
+    "shift": shift,
+    "scored": false
+  }
+  trajectory.finish(esFailed, outcome, newJObject())
+  trajectory.writeEventsToUri(getEnv(CogameSaveTrajectoryUriEnv))
