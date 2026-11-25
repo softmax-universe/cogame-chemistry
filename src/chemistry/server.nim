@@ -195,7 +195,7 @@ proc finishEpisode(runtimeConfig: RuntimeConfig) =
   quit(0)
 
 proc failEpisode(runtimeConfig: RuntimeConfig, kind, reason: string,
-    seat = -1) =
+    seat: int) =
   ## Unscored episode failure (startup incomplete, mid-episode disconnect, or
   ## LLM credentials/transport outage). Emits COGAME_PLAYER_FAILURE_URI and
   ## exits non-zero WITHOUT writing ordinary scored results.json.
@@ -224,11 +224,10 @@ proc failEpisode(runtimeConfig: RuntimeConfig, kind, reason: string,
   sleep(500)
   let failureUri = getEnv("COGAME_PLAYER_FAILURE_URI").strip()
   let payload = %*{
-    "kind": kind,
-    "error": reason,
-    "seat": seat,
-    "shift": shift,
-    "scored": false
+    "kind": "episode_inconclusive",
+    "failed_policy_index": seat,
+    "message": (if kind == "llm_infrastructure_error": "Model service unavailable"
+                else: "Player did not remain connected and registered")
   }
   echo "chemistry: unscored episode failure (", kind, "): ", reason
   if failureUri.len > 0:
@@ -261,18 +260,21 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
       sleep(200)
 
     var connectedCount = 0
+    var missingSeat = -1
     withLock stateLock:
       state.started = true
       for slot in 0 ..< config.numAgents:
         if state.playerSockets.hasKey(slot) and state.registered[slot]:
           inc connectedCount
+        elif missingSeat < 0:
+          missingSeat = slot
       echo "chemistry: starting with ", connectedCount, "/",
         config.numAgents, " players connected and registered"
 
     if connectedCount < config.numAgents:
       failEpisode(runtimeConfig, "startup_incomplete",
         "only " & $connectedCount & "/" & $config.numAgents &
-        " players connected and registered within timeout")
+        " players connected and registered within timeout", missingSeat)
       return
 
     let client = newLlmClient(config)

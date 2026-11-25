@@ -168,8 +168,10 @@ suite "real fixture server protocol":
     check not fileExists(run.resultsPath)
     check fileExists(run.failurePath)
     let failure = parseJson(readFile(run.failurePath))
-    check failure["kind"].getStr() == "llm_infrastructure_error"
-    check failure["scored"].getBool() == false
+    check failure.len == 3
+    check failure["kind"].getStr() == "episode_inconclusive"
+    check failure["failed_policy_index"].getInt() == 0
+    check failure["message"].getStr().len > 0
 
   test "invalid model reply causes a real-time missed turn and recovers on next shift":
     let run = runEpisode(gameBin, playerBin, workRoot / "invalid_first_shift", "invalid_first_shift")
