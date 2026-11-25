@@ -39,12 +39,22 @@ proc run(variant, destination: string, seed = 42): JsonNode =
       view["prompt_template"] = promptMetadata(config,
         systemPrompt(game, seat), userPrompt(game, seat, operators[seat]))
       views.add(view)
-    let orders = client.decideAll(game, operators, newSeq[ScriptKind](Seats))
+    let decisions = client.decideAll(game, operators, newSeq[ScriptKind](Seats))
     for seat in 0 ..< Seats:
-      game.applyOrder(seat, orders[seat])
-      if not trajectory.isNil:
-        trajectory.recordAppliedDecision(config, shift, seat, game.policyNames[seat],
-          views[seat], game.cogs[seat].order, client.nativeAttempts[seat])
+      let attempts =
+        if not trajectory.isNil and seat < client.nativeAttempts.len:
+          client.nativeAttempts[seat]
+        else: @[]
+      if decisions[seat].hasOrder:
+        game.applyOrder(seat, decisions[seat].order)
+        if not trajectory.isNil:
+          trajectory.recordAppliedDecision(config, shift, seat, game.policyNames[seat],
+            views[seat], game.cogs[seat].order, attempts)
+      else:
+        game.recordMissedTurn(seat, decisions[seat].error)
+        if not trajectory.isNil:
+          trajectory.recordMissedDecision(config, shift, seat,
+            views[seat], attempts, decisions[seat].status)
     game.runShift()
   trajectory.finishNativeTrajectory(game)
   result = game.resultsJson()
@@ -73,10 +83,12 @@ proc run(variant, destination: string, seed = 42): JsonNode =
     doAssert missingUsage["accepted"].getBool()
     doAssert missingUsage["input_tokens"].kind == JNull
     doAssert missingUsage["output_tokens"].kind == JNull
-    let fallback = parseJson(lines[Seats])
-    doAssert fallback["action_status"].getStr() == "fallback"
-    doAssert fallback["selected_attempt_id"].kind == JNull
-    doAssert fallback["attempts"].len == 2
+    let rejected = parseJson(lines[Seats])
+    doAssert rejected["action_status"].getStr() == "rejected"
+    doAssert rejected["selected_attempt_id"].kind == JNull
+    doAssert rejected["executed_action"].kind == JNull
+    doAssert rejected["fallback_origin"].kind == JNull
+    doAssert rejected["attempts"].len == 2
     let normalized = parseJson(lines[2 * Seats])
     doAssert normalized["action_status"].getStr() == "rejected"
     doAssert normalized["selected_attempt_id"].kind == JNull

@@ -2310,10 +2310,18 @@ body[data-embed] #board { top: 0; height: 100%; }
           '<span class="glyph chem">\u2192</span>' +
           '<span class="who">' + C.esc(job) + '</span>' +
           (e.say ? '<span class="said">"' + C.esc(e.say) + '"</span>' : '') +
-          (e.source === 'fallback' || e.source === 'scripted'
+          (e.source === 'scripted'
             ? '<span class="badge auto">auto</span>' : '') +
           // The expanded row: the seat's private notes, drawn nowhere else.
           (e.notes ? '<span class="notes">' + C.esc(e.notes) + '</span>' : ''),
+          'chem-order');
+        break;
+      case 'missed':
+        feedRow(
+          '<span class="who">' + C.esc(aliasOf(s, e.seat)) + '</span>' +
+          '<span class="glyph chem">\u2716</span>' +
+          '<span class="who">missed turn</span>' +
+          (e.reason ? '<span class="said">' + C.esc(e.reason) + '</span>' : ''),
           'chem-order');
         break;
       case 'misdrop':

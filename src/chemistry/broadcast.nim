@@ -94,6 +94,11 @@ proc rebuild*(
         if event{"sp"}.getStr().len > 0: job.add " " & event{"sp"}.getStr()
         if event{"rx"}.getStr().len > 0: job.add " \u2192 " & event{"rx"}.getStr()
         tracker.jobs[seat] = job
+    of "missed":
+      let seat = event{"seat"}.getInt(-1)
+      if seat >= 0 and seat < MaxSeats:
+        tracker.says[seat] = ""
+        tracker.jobs[seat] = "missed"
     of "react", "restart":
       let index = config.reactorIndexOf(event{"rx"}.getStr())
       if index >= 0 and index < tracker.lastReaction.len:

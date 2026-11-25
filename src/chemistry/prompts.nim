@@ -3,7 +3,7 @@ import std/[json, strutils]
 import crunchy
 import sim_config
 
-const PromptBankVersion* = "chemistry-rules-v1"
+const PromptBankVersion* = "chemistry-rules-v2"
 const Templates = [
   staticRead("prompts/plain.txt"), staticRead("prompts/numbered.txt"),
   staticRead("prompts/questions.txt"), staticRead("prompts/reordered.txt"),

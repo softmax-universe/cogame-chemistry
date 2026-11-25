@@ -19,6 +19,7 @@ type
     evRot = "rot"
     evSpoil = "spoil"
     evOrder = "order"
+    evMissed = "missed"
     evShift = "shift"
     evFamine = "famine"
     evEnd = "end"
@@ -42,6 +43,7 @@ type
     clamped*: bool
     say*: string
     notes*: string
+    detail*: string
     latencyMs*: int
     charges*: seq[int]
     foodMade*: seq[int]
@@ -108,6 +110,10 @@ proc jsonRow*(event: GameEvent): JsonNode =
     result["say"] = %event.say
     result["notes"] = %event.notes
     result["latencyMs"] = %event.latencyMs
+  of evMissed:
+    result["seat"] = %event.seat
+    result["shift"] = %event.shift
+    result["reason"] = %event.detail
   of evShift:
     result["shift"] = %event.shift
     result["charge"] = intArray(event.charges)

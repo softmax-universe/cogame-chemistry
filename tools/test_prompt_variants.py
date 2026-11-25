@@ -59,7 +59,7 @@ for variant in json.loads(manifest.read_text())["variants"]:
                 while observation["kind"] == "decision":
                     view = observation["semantic_view"]
                     metadata = view.pop("prompt_template")
-                    assert metadata["bank"] == "chemistry-rules-v1"
+                    assert metadata["bank"] == "chemistry-rules-v2"
                     assert (
                         metadata["selection"],
                         metadata["seed"],

@@ -19,15 +19,19 @@ proc freshSim(cycles = 3, distractorPeriod = 2): Sim =
   for slot in 0 ..< Seats:
     result.cogs[slot].connected = true
 
-suite "extractJsonObject is tolerant":
+suite "extractJsonObject is strict":
+  test "a raw JSON object":
+    let node = extractJsonObject("{\"job\":\"idle\"}")
+    check node{"job"}.getStr() == "idle"
+
   test "a markdown-fenced reply":
     let node = extractJsonObject("```json\n{\"job\":\"idle\"}\n```")
     check node{"job"}.getStr() == "idle"
 
-  test "a prose-prefixed reply with trailing prose":
-    let node = extractJsonObject(
-      "Sure! Here is my order:\n{\"job\": \"forage\"}\nHope that helps.")
-    check node{"job"}.getStr() == "forage"
+  test "a prose-prefixed reply with trailing prose is rejected":
+    expect ChemistryError:
+      discard extractJsonObject(
+        "Sure! Here is my order:\n{\"job\": \"forage\"}\nHope that helps.")
 
   test "a reply with no object at all raises":
     expect ChemistryError:
@@ -60,26 +64,27 @@ suite "the reply schema":
       discard plain.parseDecision(parseJson(
         """{"job":"supply","molecule":"glitter","reactor":"amber"}"""))
 
-  test "a reactor absent from this variant is CLAMPED, not rejected":
+  test "a reactor absent from this variant is REJECTED, not clamped":
     var two = freshSim(2, 0)
     two.reactors[1].charge = 0
-    let order = two.parseDecision(parseJson(
-      """{"job":"supply","molecule":"spark","reactor":"cobalt"}"""))
-    check order.clamped
-    check order.hasReactor
-    check order.reactor == rxBeryl
+    expect ChemistryError:
+      discard two.parseDecision(parseJson(
+        """{"job":"supply","molecule":"spark","reactor":"cobalt"}"""))
 
-  test "a reactor absent from this variant is CLAMPED on forage too":
-    ## The design's `reactor` row scopes the clamp to the field, not to the
-    ## job: naming an absent vat on `forage` is recorded as clamped as well.
+  test "a reactor absent from this variant is REJECTED on forage too":
     var two = freshSim(2, 0)
     two.reactors[1].charge = 0
-    let order = two.parseDecision(parseJson(
-      """{"job":"forage","reactor":"cobalt"}"""))
-    check order.job == jobForage
-    check order.clamped
-    check order.hasReactor
-    check order.reactor == rxBeryl
+    expect ChemistryError:
+      discard two.parseDecision(parseJson(
+        """{"job":"forage","reactor":"cobalt"}"""))
+
+  test "non-string field values are rejected without coercion":
+    expect ChemistryError:
+      discard sim.parseDecision(parseJson("""{"job":"idle","molecule":123}"""))
+    expect ChemistryError:
+      discard sim.parseDecision(parseJson("""{"job":"idle","reactor":true}"""))
+    expect ChemistryError:
+      discard sim.parseDecision(parseJson("""{"job":"idle","say":42}"""))
 
   test "a feedstock the named reactor does not take is ACCEPTED as written":
     ## The misdrop is the graph test and must stay expressible.
@@ -99,8 +104,9 @@ suite "the reply schema":
     check validateUtf8(order.say) == -1
     check validateUtf8(order.notes) == -1
 
-suite "degrade, never hang":
-  test "with no credentials the client disables itself and every seat plays courier":
+suite "no fallbacks: reject and record missed turns":
+  test "with no credentials unscripted seats miss their turn without fallback":
+    delEnv("COWORLD_LLM_ENDPOINT")
     delEnv("AWS_ENDPOINT_URL_BEDROCK_RUNTIME")
     delEnv("AWS_BEARER_TOKEN_BEDROCK")
     delEnv("ANTHROPIC_API_KEY")
@@ -110,13 +116,13 @@ suite "degrade, never hang":
     check client.disabled
     var prompts = newSeq[string](Seats)
     var scripted = newSeq[ScriptKind](Seats)
-    let orders = client.decideAll(sim, prompts, scripted)
-    check orders.len == Seats
+    let decisions = client.decideAll(sim, prompts, scripted)
+    check decisions.len == Seats
     for slot in 0 ..< Seats:
-      check orders[slot].source == osScripted
-      check sim.normalizeOrder(orders[slot]).ok
+      check not decisions[slot].hasOrder
+      check decisions[slot].status == asMissing
 
-  test "a dead transport falls back to courier, marks the source, and never raises":
+  test "a dead transport rejects and marks missed turns without substituting an order":
     ## A closed port on localhost is a transport that fails immediately: the
     ## same path a timeout, a 429, a 403 or a junk body takes.
     putEnv("AWS_ENDPOINT_URL_BEDROCK_RUNTIME", "http://127.0.0.1:9/bedrock")
@@ -131,16 +137,13 @@ suite "degrade, never hang":
     for slot in 0 ..< Seats:
       prompts[slot] = "hold your lane"
     var scripted = newSeq[ScriptKind](Seats)
-    let orders = client.decideAll(sim, prompts, scripted)
+    let decisions = client.decideAll(sim, prompts, scripted)
     ## ONE batch carries every open seat -- eight on shift 1.
     check client.lastBatchSize == Seats
     for slot in 0 ..< Seats:
-      check orders[slot].source == osFallback
-      let courier = sim.courierOrder(slot)
-      check orders[slot].job == courier.job
-      check orders[slot].hasMolecule == courier.hasMolecule
-      if courier.hasMolecule:
-        check orders[slot].molecule == courier.molecule
+      check not decisions[slot].hasOrder
+      check decisions[slot].status == asRejected
+      check decisions[slot].error.len > 0
 
   test "scripted seats never enter the batch":
     let sim = freshSim()
@@ -154,18 +157,13 @@ suite "degrade, never hang":
     var scripted = newSeq[ScriptKind](Seats)
     for slot in 0 ..< Seats:
       scripted[slot] = (if slot mod 2 == 0: skCourier else: skFreeloader)
-    let orders = client.decideAll(sim, prompts, scripted)
+    let decisions = client.decideAll(sim, prompts, scripted)
     check client.lastBatchSize == 0
     for slot in 0 ..< Seats:
-      check orders[slot].source == osScripted
+      check decisions[slot].hasOrder
+      check decisions[slot].order.source == osScripted
 
-  test "a seat that never connected plays courier and never enters the batch":
-    ## Design: "a seat that never connected, or whose socket dies
-    ## mid-episode, plays `courier` for every remaining shift." Without this
-    ## the seat is issued a request whose operator block is empty. The
-    ## transport is the same closed port as above, so the six connected seats
-    ## fail fast and land on the fallback while the two unconnected ones were
-    ## never asked at all.
+  test "a disconnected seat misses its turn and never enters the batch":
     putEnv("AWS_ENDPOINT_URL_BEDROCK_RUNTIME", "http://127.0.0.1:9/bedrock")
     putEnv("AWS_BEARER_TOKEN_BEDROCK", "not-a-real-token")
     defer:
@@ -178,17 +176,14 @@ suite "degrade, never hang":
     check not client.disabled
     var prompts = newSeq[string](Seats)
     var scripted = newSeq[ScriptKind](Seats)
-    let orders = client.decideAll(sim, prompts, scripted)
+    let decisions = client.decideAll(sim, prompts, scripted)
     check client.lastBatchSize == Seats - 2
     for slot in [2, 5]:
-      let courier = sim.courierOrder(slot)
-      check orders[slot].source == osScripted
-      check orders[slot].job == courier.job
-      check orders[slot].hasMolecule == courier.hasMolecule
-      if courier.hasMolecule:
-        check orders[slot].molecule == courier.molecule
+      check not decisions[slot].hasOrder
+      check decisions[slot].status == asMissing
     for slot in [0, 1, 3, 4, 6, 7]:
-      check orders[slot].source == osFallback
+      check not decisions[slot].hasOrder
+      check decisions[slot].status == asRejected
 
 suite "the observation and the prompts":
   let sim = freshSim()
@@ -219,6 +214,9 @@ suite "the observation and the prompts":
     check "glitter" notin user
     let system = two.systemPrompt(0)
     check "ARGON" in system
+    check "Two vats (reactors)" in system
+    check "glitter" notin system
+    check "cobalt" notin system
+    check "Example:" in system
     check "reply with ONLY one JSON object" in system
-    check "begin with the character {" in system
     check "supply | forage | hoard | idle" in system
