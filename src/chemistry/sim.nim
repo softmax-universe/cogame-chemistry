@@ -381,23 +381,10 @@ proc runShift*(sim: var Sim) =
 # Orders
 # --------------------------------------------------------------------------
 
-proc lowestChargeReactor(sim: Sim): ReactorName =
-  ## The clamp target the design names for a reactor absent in this variant:
-  ## the present reactor with the lowest charge.
-  var best = 0
-  var bestCharge = high(int)
-  for index in 0 ..< sim.reactors.len:
-    if sim.reactors[index].charge < bestCharge:
-      bestCharge = sim.reactors[index].charge
-      best = index
-  sim.reactors[best].name
-
 proc normalizeOrder*(sim: Sim, order: Order):
     tuple[ok: bool, order: Order, error: string] =
-  ## Validates one standing order against THIS variant and clamps the one
-  ## thing the design says is clampable (an absent reactor, on `supply` and on
-  ## `forage` alike). Everything else is an invalid reply -- including a
-  ## species whose vent is absent here. A feedstock the named reactor does not
+  ## Validates one standing order against THIS variant. An absent species or
+  ## absent reactor is an invalid reply. A feedstock the named reactor does not
   ## take is ACCEPTED as written: the misdrop is the graph test and must stay
   ## expressible.
   var normalized = order
@@ -409,11 +396,8 @@ proc normalizeOrder*(sim: Sim, order: Order):
   of jobForage:
     normalized.hasMolecule = false
     if order.hasReactor and not sim.config.hasReactor(order.reactor):
-      ## Clamped, not silently dropped: the seat named a vat, and the `order`
-      ## event has to say the room moved it.
-      normalized.reactor = sim.lowestChargeReactor()
-      normalized.hasReactor = true
-      normalized.clamped = true
+      return (false, normalized,
+        $order.reactor & " does not exist in this variant")
   of jobSupply, jobHoard:
     if not order.hasMolecule:
       return (false, normalized, "job " & $order.job & " needs a molecule")
@@ -424,10 +408,8 @@ proc normalizeOrder*(sim: Sim, order: Order):
       if not order.hasReactor:
         return (false, normalized, "job supply needs a reactor")
       if not sim.config.hasReactor(order.reactor):
-        ## Clamped to the present reactor with the lowest charge.
-        normalized.reactor = sim.lowestChargeReactor()
-        normalized.hasReactor = true
-        normalized.clamped = true
+        return (false, normalized,
+          $order.reactor & " does not exist in this variant")
     else:
       normalized.hasReactor = false
   normalized.say = sayText(normalized.say)
@@ -436,24 +418,37 @@ proc normalizeOrder*(sim: Sim, order: Order):
 
 proc applyOrder*(sim: var Sim, slot: int, order: Order) =
   ## Installs one seat's standing order for the shift about to be played and
-  ## records the `order` event the feed and the replay read.
+  ## records the `order` event the feed and the replay read. Invalid orders are
+  ## rejected rather than coerced or substituted.
   let normalized = sim.normalizeOrder(order)
-  var final =
-    if normalized.ok: normalized.order
-    else: sim.courierOrder(slot)
   if not normalized.ok:
-    final.source = osFallback
+    raise newException(ChemistryError, normalized.error)
+  let final = normalized.order
   sim.cogs[slot].lastOrder = sim.cogs[slot].order
   sim.cogs[slot].order = final
   sim.cogs[slot].hasOrder = true
+  sim.cogs[slot].missedTurn = false
+  sim.cogs[slot].missedReason = ""
   sim.cogs[slot].say = final.say
   if final.notes.len > 0:
     sim.cogs[slot].notes = final.notes
   sim.emit GameEvent(kind: evOrder, seat: slot, shift: sim.shift + 1,
     job: final.job, species: final.molecule, hasSpecies: final.hasMolecule,
     reactor: final.reactor, hasReactor: final.hasReactor,
-    source: final.source, clamped: final.clamped, say: final.say,
+    source: final.source, clamped: false, say: final.say,
     notes: final.notes, latencyMs: final.latencyMs)
+
+proc recordMissedTurn*(sim: var Sim, slot: int, reason = "") =
+  ## Records that a seat produced no valid order for the shift about to be
+  ## played. Advances time without executing an order on that seat's behalf.
+  sim.cogs[slot].lastOrder = sim.cogs[slot].order
+  sim.cogs[slot].hasOrder = false
+  sim.cogs[slot].missedTurn = true
+  sim.cogs[slot].missedTurns.inc
+  sim.cogs[slot].missedReason = errorText(reason)
+  sim.cogs[slot].say = ""
+  sim.emit GameEvent(kind: evMissed, seat: slot, shift: sim.shift + 1,
+    detail: sim.cogs[slot].missedReason)
 
 # --------------------------------------------------------------------------
 # Results
@@ -470,6 +465,7 @@ proc resultsJson*(sim: Sim): JsonNode =
   var delivered = newJArray()
   var misdrops = newJArray()
   var hoarded = newJArray()
+  var missedTurns = newJArray()
   var best = 0
   for slot in 0 ..< Seats:
     best = max(best, sim.cogs[slot].foodEaten)
@@ -482,6 +478,7 @@ proc resultsJson*(sim: Sim): JsonNode =
     delivered.add(%sim.cogs[slot].delivered)
     misdrops.add(%sim.cogs[slot].misdrops)
     hoarded.add(%sim.cogs[slot].hoard)
+    missedTurns.add(%sim.cogs[slot].missedTurns)
   var reactions = newJArray()
   for reactor in sim.reactors:
     reactions.add(%reactor.reactions)
@@ -494,6 +491,7 @@ proc resultsJson*(sim: Sim): JsonNode =
     "delivered": delivered,
     "misdrops": misdrops,
     "hoarded": hoarded,
+    "missed_turns": missedTurns,
     "reactions": reactions,
     "food_made": sim.foodMade,
     "food_rotted": sim.foodRotted,

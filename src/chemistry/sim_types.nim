@@ -87,7 +87,6 @@ type
   OrderSource* = enum
     osLlm = "llm"
     osRetry = "retry"
-    osFallback = "fallback"
     osScripted = "scripted"
     osExternal = "external"
 
@@ -157,6 +156,9 @@ type
     notes*: string       ## private, this seat only
     connected*: bool
     lastAction*: Action
+    missedTurn*: bool
+    missedTurns*: int
+    missedReason*: string
 
   Molecule* = object
     cell*: Cell

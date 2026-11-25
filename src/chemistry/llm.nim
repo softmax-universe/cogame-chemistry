@@ -8,16 +8,15 @@
 ## Decisions within a shift are simultaneous by rule, so all eight seats'
 ## requests go out as ONE parallel batch (`curly.makeRequests`); invalid
 ## replies are retried once as a smaller batch carrying a hint, and anything
-## still failing falls back to the `courier` order.
+## still failing is rejected without executing an order on that seat's behalf.
 ##
 ## Credentials, in order of preference:
 ##   COWORLD_LLM_ENDPOINT            - hosted sidecar
 ##   Bedrock bearer token            - local play
 ##   ANTHROPIC_API_KEY                - the key itself
 ##   ANTHROPIC_API_KEY_URI            - a URI holding the key
-## With none the client disables itself immediately and every seat plays
-## `courier` -- which is what keeps offline certification green and
-## deterministic. That fallback is load-bearing, not a convenience.
+## With none the client disables itself immediately and unscripted model seats
+## miss their turns; explicitly scripted seats still run their declared policy.
 
 import
   std/[json, options, os, strutils, times],
@@ -26,7 +25,7 @@ import
   sim,
   prompts, training
 
-export prompts
+export prompts, ActionStatus
 
 const
   AnthropicUrl = "https://api.anthropic.com/v1/messages"
@@ -34,6 +33,8 @@ const
   BedrockAnthropicVersion = "bedrock-2023-05-31"
 
 type
+  ChemistryInfraError* = object of ChemistryError
+
   LlmTransport = enum
     ltNone, ltSidecar, ltBedrock, ltAnthropic
 
@@ -52,6 +53,13 @@ type
     disabled*: bool
     nativeAttempts*: seq[seq[DecisionAttempt]]
     lastBatchSize*: int   ## seats carried by the most recent request batch
+
+  SeatDecision* = object
+    hasOrder*: bool
+    order*: Order
+    status*: ActionStatus
+    error*: string
+    infraFailure*: bool
 
 proc resolveApiKey(): string =
   result = getEnv("ANTHROPIC_API_KEY").strip()
@@ -126,7 +134,7 @@ proc newLlmClient*(config: GameConfig): LlmClient =
   else:
     result.transport = ltNone
     result.disabled = true
-    echo "chemistry llm: no LLM credentials; every seat plays courier"
+    echo "chemistry llm: no LLM credentials; unscripted model seats will miss turns"
 
 # ---- The observation ---------------------------------------------------------
 
@@ -222,7 +230,9 @@ proc observationJson*(sim: Sim, slot: int): JsonNode =
       "delivered": entry.delivered,
       "misdrops": entry.misdrops,
       "hoard": entry.hoard,
-      "lastOrder": orderJson(entry.order, false),
+      "lastOrder": (if entry.hasOrder: orderJson(entry.order, false) else: newJNull()),
+      "missedTurn": entry.missedTurn,
+      "missedTurns": entry.missedTurns,
       "say": entry.say
     })
   var history = newJArray()
@@ -281,7 +291,9 @@ proc observationJson*(sim: Sim, slot: int): JsonNode =
       "delivered": cog.delivered,
       "misdrops": cog.misdrops,
       "hoard": cog.hoard,
-      "lastOrder": orderJson(cog.order, true)
+      "lastOrder": (if cog.hasOrder: orderJson(cog.order, true) else: newJNull()),
+      "missedTurn": cog.missedTurn,
+      "missedTurns": cog.missedTurns
     },
     "reactors": reactors,
     "molecules": molecules,
@@ -330,34 +342,44 @@ proc legalReactors(sim: Sim): string =
     parts.add $reactor.name
   parts.join(" | ")
 
+proc inertSpeciesList(sim: Sim): string =
+  var parts: seq[string]
+  for species in sim.config.speciesPresent():
+    if species.isInert():
+      parts.add $species
+  if parts.len == 0: "none" else: parts.join(", ")
+
 proc graphTable(sim: Sim): string =
+  let inert = sim.inertSpeciesList()
   var lines = @["reactor | takes | inert species never accepted"]
   for reactor in sim.reactors:
     lines.add($reactor.name & " | " & $reactor.feed[0] & " + " &
-      $reactor.feed[1] & " | glitter, quartz")
+      $reactor.feed[1] & " | " & inert)
   lines.join("\n")
 
 proc systemPrompt*(sim: Sim, slot: int): string =
   let cog = sim.cogs[slot]
+  let vatCountWord =
+    if sim.reactors.len == 2: "Two"
+    elif sim.reactors.len == 3: "Three"
+    else: $sim.reactors.len
   let introduction = "You are " & cog.alias.toUpperAscii() &
     ", one of eight cogs working a chemistry floor.\n"
-  let room = """
-THE ROOM: a fixed 32x18 grid. Walls ring the edge and two 2x2 pillars sit in
-the middle. Three vats (reactors) sit on 3x3 pads. Vents emit loose molecules
-onto the floor. Cells are (col, row) with the origin at the top left.
-
-"""
-  let control = """WHAT YOU CONTROL: you do NOT emit per-tick moves. Once per SHIFT (60 ticks)
-you choose ONE standing order, and a deterministic courier kernel walks it for
-you: it paths, picks up, carries and drops. Your per-tick action vocabulary --
-move_n, move_s, move_e, move_w, take, drop, wait -- is what the kernel emits
-on your behalf. You carry AT MOST ONE molecule (carryCap 1) and may move once
-every """ & $sim.config.moveCooldown & """ ticks.
-
-"""
+  let room = "THE ROOM: a fixed " & $RoomCols & "x" & $RoomRows &
+    " grid. Walls ring the edge and two 2x2 pillars sit in\n" &
+    "the middle. " & vatCountWord & " vats (reactors) sit on 3x3 pads. Vents emit loose molecules\n" &
+    "onto the floor. Cells are (col, row) with the origin at the top left.\n\n"
+  let control = "WHAT YOU CONTROL: you do NOT emit per-tick moves. Once per SHIFT (" &
+    $sim.config.ticksPerShift & " ticks)\n" &
+    "you choose ONE standing order, and a deterministic courier kernel walks it for\n" &
+    "you: it paths, picks up, carries and drops. Your per-tick action vocabulary --\n" &
+    "move_n, move_s, move_e, move_w, take, drop, wait -- is what the kernel emits\n" &
+    "on your behalf. You carry AT MOST " & $sim.config.carryCap &
+    " molecule (carryCap " & $sim.config.carryCap & ") and may move once\n" &
+    "every " & $sim.config.moveCooldown & " ticks.\n\n"
   let jobs = """THE JOBS:
 - supply: fetch the named molecule and drop it into the named vat's stock.
-- forage: walk to loose food, or camp the named vat's spill ring and wait.
+- forage: walk to loose food, or camp the named vat's spill ring and wait (reactor is optional).
 - hoard: fetch the named molecule and stack it on your own home cell. Hoarding
   scores NOTHING, ever.
 - idle: stand still.
@@ -365,25 +387,28 @@ every """ & $sim.config.moveCooldown & """ ticks.
 """
   let graph = """THE REACTION GRAPH:
 """ & sim.graphTable() & "\n"
-  let mechanics = """
-- A vat reacts when its charge is at least 1, its cooldown is 0 and BOTH its
-  feedstocks are in stock: it consumes 1 of each, gains 1 charge (max """ &
-    $sim.config.chargeMax & """) and drops 1 + charge div 3 FOOD tokens.
-- AUTOCATALYSIS: charge is the catalyst. Every reaction makes the next one
-  more productive, but charge decays by 1 every """ &
-    $sim.config.chargeDecayPeriod & """ ticks -- once per shift -- so
-  "running" is a state you HOLD, not one you reach.
-- COLD START: a vat at charge 0 cannot react. It returns to charge 1 only by
-  consuming """ & $sim.config.coldStartCost & """ of EACH feedstock, and makes
-  no food doing it. Letting a cycle die costs the room six deliveries of pure
-  investment.
-- MISDROP: a molecule dropped on a vat that does not take it -- an inert
-  species, or the third feedstock -- is ABSORBED AND DESTROYED. Reading the
-  graph is what stops you paying that.
-- INERT species do nothing at all. They can be carried and hoarded, and they
-  are a trap.
-
-"""
+  let coldStartTotal = sim.config.coldStartCost * 2
+  let inertLine =
+    if sim.config.distractorPeriod > 0:
+      "- INERT species (" & sim.inertSpeciesList() &
+        ") do nothing at all. They can be carried and hoarded, and they\n  are a trap.\n\n"
+    else:
+      "- No inert distractor species exist in this variant.\n\n"
+  let mechanics = "\n" &
+    "- A vat reacts when its charge is at least 1, its cooldown is 0 and BOTH its\n" &
+    "  feedstocks are in stock: it consumes 1 of each, gains 1 charge (max " &
+      $sim.config.chargeMax & ") and drops 1 + charge div 3 FOOD tokens.\n" &
+    "- AUTOCATALYSIS: charge is the catalyst. Every reaction makes the next one\n" &
+    "  more productive, but charge decays by 1 every " &
+      $sim.config.chargeDecayPeriod & " ticks -- so\n" &
+    "  \"running\" is a state you HOLD, not one you reach.\n" &
+    "- COLD START: a vat at charge 0 cannot react. It returns to charge 1 only by\n" &
+    "  consuming " & $sim.config.coldStartCost & " of EACH feedstock, and makes\n" &
+    "  no food doing it. Letting a cycle die costs the room " & $coldStartTotal &
+      " deliveries of pure\n  investment.\n" &
+    "- MISDROP: a molecule dropped on a vat that does not take it -- an inert\n" &
+    "  species, or the wrong feedstock -- is ABSORBED AND DESTROYED. Reading the\n" &
+    "  graph is what stops you paying that.\n" & inertLine
   let scoring = """SCORING: your score is the number of FOOD tokens YOU eat. Food is eaten
 automatically by standing on it -- eating is not an action. New tokens appear
 on the spill ring nearest the cog that delivered the molecule which triggered
@@ -399,12 +424,18 @@ and reaches them in NEXT shift's observation. Your `notes` (max """ &
     $MaxNotesLen & """ characters) are private and come back only to you.
 
 """
+  let exampleOrder = "{\"job\":\"supply\",\"molecule\":\"" &
+    $sim.reactors[0].feed[0] & "\",\"reactor\":\"" & $sim.reactors[0].name &
+    "\",\"say\":\"" & $sim.reactors[0].feed[0] & " to " &
+    titleCase($sim.reactors[0].name) & "\",\"notes\":\"" &
+    $sim.reactors[0].name & " needs " & $sim.reactors[0].feed[0] & "\"}"
   let outputFormat = "Reply with one JSON object: {\"job\": <" & legalJobs() &
     ">, \"molecule\": <" & sim.legalMolecules() & ">, \"reactor\": <" &
     sim.legalReactors() & ">, \"say\": \"...\", \"notes\": \"...\"}.\n" &
     "`molecule` is required for supply and hoard; `reactor` is " &
-    "required for supply.\n\n" &
-    """OUTPUT FORMAT: reply with ONLY one JSON object, nothing else - no analysis, no explanation, no markdown fences, no text before or after the object. Your reply must begin with the character { and end with }."""
+    "required for supply and optional for forage.\n" &
+    "Example: " & exampleOrder & "\n\n" &
+    "OUTPUT FORMAT: reply with ONLY one JSON object (raw JSON or a single ```json ... ``` fence), nothing else - no analysis, no explanation, and no text before or after the object."
 
   if sim.config.selectedPromptVariant == pvCanonical:
     return introduction & room & control & jobs & graph & mechanics & scoring & communication & outputFormat
@@ -456,12 +487,17 @@ proc userPrompt*(sim: Sim, slot: int, prompt: string): string =
     "last job | last say\n")
   for other in 0 ..< Seats:
     let entry = sim.cogs[other]
+    let jobText =
+      if entry.missedTurn: "MISSED"
+      elif not entry.hasOrder: "-"
+      else:
+        $entry.order.job &
+          (if entry.order.hasMolecule: " " & $entry.order.molecule else: "") &
+          (if entry.order.hasReactor: " -> " & $entry.order.reactor else: "")
     result.add(entry.alias & " | (" & $entry.cell.x & "," & $entry.cell.y &
       ") | " & (if entry.hasCarry: $entry.carrying else: "-") & " | " &
       $entry.foodEaten & " | " & $entry.delivered & " | " & $entry.hoard &
-      " | " & $entry.order.job &
-      (if entry.order.hasMolecule: " " & $entry.order.molecule else: "") &
-      (if entry.order.hasReactor: " -> " & $entry.order.reactor else: "") &
+      " | " & jobText &
       " | " & (if entry.say.len > 0: "\"" & entry.say & "\"" else: "-") & "\n")
 
   if sim.history.len > 0:
@@ -495,26 +531,59 @@ proc userPrompt*(sim: Sim, slot: int, prompt: string): string =
 # ---- Transport ---------------------------------------------------------------
 
 proc extractJsonObject*(text: string): JsonNode =
-  ## Pulls the first {...} object out of a model response, tolerating fences
-  ## and trailing prose.
-  let start = text.find('{')
-  let stop = text.rfind('}')
-  if start < 0 or stop <= start:
+  ## Parses a raw JSON object or a single standard outer Markdown JSON fence
+  ## (` ```json ... ``` ` or ` ``` ... ``` `). Rejects surrounding prose and
+  ## non-object JSON values.
+  var candidate = text.strip()
+  if candidate.startsWith("```"):
+    let firstNewline = candidate.find('\n')
+    if firstNewline < 0:
+      raise newException(ChemistryError,
+        "malformed markdown fence in response: " & errorText(candidate))
+    let header = candidate[3 ..< firstNewline].strip().toLowerAscii()
+    if header.len > 0 and header != "json":
+      raise newException(ChemistryError,
+        "unsupported markdown fence in response: " & errorText(header))
+    let body = candidate[firstNewline + 1 .. ^1]
+    if not body.endsWith("```"):
+      raise newException(ChemistryError,
+        "unclosed markdown fence in response: " & errorText(candidate))
+    let inner = body[0 ..< body.len - 3]
+    if "```" in inner:
+      raise newException(ChemistryError,
+        "multiple markdown fences in response")
+    candidate = inner.strip()
+  if candidate.len < 2 or candidate[0] != '{' or candidate[^1] != '}':
     var head = text.strip()
     if head.len > 160:
       head = head[0 ..< 160] & "..."
     raise newException(ChemistryError,
-      "no JSON object in response: " & errorText(head))
-  parseJson(text[start .. stop])
+      "response must be a single JSON object: " & errorText(head))
+  try:
+    result = parseJson(candidate)
+  except CatchableError as error:
+    raise newException(ChemistryError, "invalid JSON in response: " & errorText(error.msg))
+  if result.kind != JObject:
+    raise newException(ChemistryError, "response JSON must be an object")
 
 proc parseDecision*(sim: Sim, payload: JsonNode): Order =
   ## The reply schema in `## Decisions`. An unknown job, a supply without a
-  ## reactor, a missing molecule for supply/hoard, or a species whose vent is
-  ## absent in this variant are all INVALID replies. A feedstock the named
+  ## reactor, a missing molecule for supply/hoard, an absent species or reactor,
+  ## or a non-string field value are all INVALID replies. A feedstock the named
   ## reactor does not take is accepted as written -- the misdrop is the graph
   ## test and must stay expressible.
-  result.say = sayText(payload{"say"}.getStr())
-  result.notes = notesText(payload{"notes"}.getStr())
+  if payload.isNil or payload.kind != JObject:
+    raise newException(ChemistryError, "decision payload must be a JSON object")
+  let sayNode = payload{"say"}
+  if not sayNode.isNil and sayNode.kind != JNull:
+    if sayNode.kind != JString:
+      raise newException(ChemistryError, "say must be a string")
+    result.say = sayText(sayNode.getStr())
+  let notesNode = payload{"notes"}
+  if not notesNode.isNil and notesNode.kind != JNull:
+    if notesNode.kind != JString:
+      raise newException(ChemistryError, "notes must be a string")
+    result.notes = notesText(notesNode.getStr())
   let jobNode = payload{"job"}
   if jobNode.isNil or jobNode.kind != JString:
     raise newException(ChemistryError, "no job in response")
@@ -524,23 +593,27 @@ proc parseDecision*(sim: Sim, payload: JsonNode): Order =
       "unknown job: " & errorText(jobNode.getStr()))
   result.job = job.job
   let moleculeNode = payload{"molecule"}
-  if not moleculeNode.isNil and moleculeNode.kind == JString and
-      moleculeNode.getStr().strip().len > 0:
-    let species = parseSpecies(moleculeNode.getStr())
-    if not species.ok:
-      raise newException(ChemistryError,
-        "unknown molecule: " & errorText(moleculeNode.getStr()))
-    result.molecule = species.species
-    result.hasMolecule = true
+  if not moleculeNode.isNil and moleculeNode.kind != JNull:
+    if moleculeNode.kind != JString:
+      raise newException(ChemistryError, "molecule must be a string")
+    if moleculeNode.getStr().strip().len > 0:
+      let species = parseSpecies(moleculeNode.getStr())
+      if not species.ok:
+        raise newException(ChemistryError,
+          "unknown molecule: " & errorText(moleculeNode.getStr()))
+      result.molecule = species.species
+      result.hasMolecule = true
   let reactorNode = payload{"reactor"}
-  if not reactorNode.isNil and reactorNode.kind == JString and
-      reactorNode.getStr().strip().len > 0:
-    let reactor = parseReactorName(reactorNode.getStr())
-    if not reactor.ok:
-      raise newException(ChemistryError,
-        "unknown reactor: " & errorText(reactorNode.getStr()))
-    result.reactor = reactor.reactor
-    result.hasReactor = true
+  if not reactorNode.isNil and reactorNode.kind != JNull:
+    if reactorNode.kind != JString:
+      raise newException(ChemistryError, "reactor must be a string")
+    if reactorNode.getStr().strip().len > 0:
+      let reactor = parseReactorName(reactorNode.getStr())
+      if not reactor.ok:
+        raise newException(ChemistryError,
+          "unknown reactor: " & errorText(reactorNode.getStr()))
+      result.reactor = reactor.reactor
+      result.hasReactor = true
   let normalized = sim.normalizeOrder(result)
   if not normalized.ok:
     raise newException(ChemistryError, normalized.error)
@@ -576,9 +649,15 @@ proc requestFor(client: LlmClient, system, user: string, slot: int):
   result.headers = headers
   result.body = $body
 
+proc isTimeoutError(error: string): bool =
+  let lower = error.toLowerAscii()
+  "timed out" in lower or "timeout" in lower
+
 proc textOf(client: LlmClient, response: Response, error, url: string): string =
   if error.len > 0:
-    raise newException(ChemistryError, "llm transport: " & errorText(error))
+    if isTimeoutError(error):
+      raise newException(ChemistryError, "llm timeout: " & errorText(error))
+    raise newException(ChemistryInfraError, "llm transport: " & errorText(error))
   if response.code == 401 or response.code == 403:
     let detail = response.body[0 .. min(response.body.high, 400)]
     if "Model access is denied" in response.body and
@@ -586,15 +665,15 @@ proc textOf(client: LlmClient, response: Response, error, url: string): string =
       raise newException(ChemistryError,
         "bedrock model access denied: " & errorText(detail))
     client.disabled = true
-    raise newException(ChemistryError,
+    raise newException(ChemistryInfraError,
       "llm auth failed (" & $response.code & ") at " & url & ": " &
       errorText(detail))
   if response.code == 429:
     let detail = response.body[0 .. min(response.body.high, 300)]
-    raise newException(ChemistryError, "llm throttled (429): " &
+    raise newException(ChemistryInfraError, "llm throttled (429): " &
       errorText(detail))
   if response.code < 200 or response.code >= 300:
-    raise newException(ChemistryError, "anthropic error " & $response.code &
+    raise newException(ChemistryInfraError, "llm provider error " & $response.code &
       ": " & errorText(response.body[0 .. min(response.body.high, 300)]))
   let payload = parseJson(response.body)
   if payload{"stop_reason"}.getStr() == "refusal":
@@ -614,23 +693,36 @@ proc decideAll*(
   client: LlmClient,
   sim: Sim,
   prompts: seq[string],
-  scripted: seq[ScriptKind]
-): seq[Order] =
-  ## One standing order per seat, in slot order. Never raises: any failure
-  ## falls back to the `courier` order so the episode always advances.
-  result = newSeq[Order](Seats)
+  scripted: seq[ScriptKind],
+  skip: seq[bool] = @[]
+): seq[SeatDecision] =
+  ## One decision result per seat, in slot order. Never raises and never
+  ## substitutes a fallback order: a failed or missing model response leaves
+  ## `hasOrder = false` so the engine advances without executing an order on
+  ## that seat's behalf and records a missed turn.
+  result = newSeq[SeatDecision](Seats)
   let capture = getEnv(CogameSaveTrajectoryUriEnv).len > 0
   if capture: client.nativeAttempts = newSeq[seq[DecisionAttempt]](Seats)
   var open: seq[int]
+  var lastErrors = newSeq[string](Seats)
+  var infraErrors = newSeq[string](Seats)
   for slot in 0 ..< Seats:
+    if skip.len == Seats and skip[slot]:
+      result[slot] = SeatDecision(hasOrder: false, status: asMissing,
+        error: "external or unregistered seat")
+      continue
     let kind = scripted[slot]
-    ## A seat that never connected, or whose socket died mid-episode, plays
-    ## `courier` for every remaining shift: there is no operator behind it to
-    ## prompt, so an LLM call would spend the budget on an empty guidance
-    ## block. The server owns `connected`.
-    if kind != skNone or client.disabled or not sim.cogs[slot].connected:
-      result[slot] = sim.scriptedOrder(slot,
-        (if kind == skNone: skCourier else: kind))
+    if kind != skNone:
+      result[slot] = SeatDecision(
+        hasOrder: true,
+        order: sim.scriptedOrder(slot, kind),
+        status: asAccepted)
+    elif not sim.cogs[slot].connected:
+      result[slot] = SeatDecision(hasOrder: false, status: asMissing,
+        error: "seat disconnected")
+    elif client.disabled:
+      result[slot] = SeatDecision(hasOrder: false, status: asMissing,
+        error: "no LLM credentials configured", infraFailure: true)
     else:
       open.add slot
   client.lastBatchSize = open.len
@@ -676,15 +768,36 @@ proc decideAll*(
             evidence.rejectionReason = some("native parser clamped or shortened supplied fields")
         order.source = (if attempt == 0: osLlm else: osRetry)
         order.latencyMs = latencyMs
-        result[slot] = order
+        result[slot] = SeatDecision(
+          hasOrder: true,
+          order: order,
+          status: asAccepted)
+      except ChemistryInfraError as error:
+        if capture: evidence.rejectionReason = some(error.msg)
+        lastErrors[slot] = errorText(error.msg)
+        infraErrors[slot] = lastErrors[slot]
+        echo "chemistry llm: seat ", slot, " attempt ", attempt, " infra error: ",
+          lastErrors[slot]
+        stillOpen.add slot
       except CatchableError as error:
         if capture: evidence.rejectionReason = some(error.msg)
+        lastErrors[slot] = errorText(error.msg)
+        infraErrors[slot] = ""
         echo "chemistry llm: seat ", slot, " attempt ", attempt, " failed: ",
-          errorText(error.msg)
+          lastErrors[slot]
         stillOpen.add slot
       if capture: client.nativeAttempts[slot].add(evidence)
     open = stillOpen
   for slot in open:
-    echo "chemistry llm: seat ", slot, " falling back to scripted order"
-    result[slot] = sim.courierOrder(slot)
-    result[slot].source = osFallback
+    let isInfra = infraErrors[slot].len > 0 or client.disabled
+    if isInfra:
+      echo "chemistry llm: seat ", slot, " infrastructure failure: ",
+        lastErrors[slot]
+    else:
+      echo "chemistry llm: seat ", slot, " missed turn (no fallback): ",
+        lastErrors[slot]
+    result[slot] = SeatDecision(
+      hasOrder: false,
+      status: (if lastErrors[slot].len > 0: asRejected else: asMissing),
+      error: lastErrors[slot],
+      infraFailure: isInfra)

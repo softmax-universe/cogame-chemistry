@@ -195,7 +195,7 @@ when isMainModule:
       response = %*{"response": $action}
     of "step":
       doAssert not game.done and request["decision_id"].getInt() == id
-      let action = parseJson(request["response"].getStr())
+      let action = extractJsonObject(request["response"].getStr())
       let parsed = view.parseDecision(action)
       game.applyOrder(seat, parsed)
       inc id

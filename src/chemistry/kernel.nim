@@ -26,18 +26,8 @@ proc bestForageReactor(sim: Sim, order: Order): int =
 
 proc supplyReactor(sim: Sim, order: Order): int =
   if order.hasReactor:
-    let index = sim.room.reactorIndex(order.reactor)
-    if index >= 0:
-      return index
-  ## An order naming an absent reactor is clamped before it ever reaches the
-  ## kernel; this is the belt-and-braces path.
-  var best = 0
-  var bestCharge = high(int)
-  for index in 0 ..< sim.reactors.len:
-    if sim.reactors[index].charge < bestCharge:
-      bestCharge = sim.reactors[index].charge
-      best = index
-  best
+    return sim.room.reactorIndex(order.reactor)
+  -1
 
 proc occupied(sim: Sim, slot: int, cell: Cell): bool =
   for other in 0 ..< Seats:
@@ -107,6 +97,8 @@ proc kernelAction*(sim: Sim, slot: int): Action =
   ## This tick's action for one seat, from its standing order and the state as
   ## it stands at step 2 of the tick resolution order.
   let cog = sim.cogs[slot]
+  if cog.missedTurn:
+    return acWait
   let order = cog.order
 
   case order.job
@@ -128,7 +120,10 @@ proc kernelAction*(sim: Sim, slot: int): Action =
     if cog.hasCarry and cog.carrying == wanted:
       let targets =
         if order.job == jobHoard: @[cog.home]
-        else: sim.room.pad[sim.supplyReactor(order)]
+        else:
+          let index = sim.supplyReactor(order)
+          if index < 0: return acWait
+          sim.room.pad[index]
       let step = sim.walk(slot, targets)
       return (if step.arrived: acDrop else: step.action)
     if cog.hasCarry:

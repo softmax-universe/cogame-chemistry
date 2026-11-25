@@ -56,6 +56,8 @@ type
     viewers: Table[WebSocket, GlobalViewerState]
     started: bool
     finished: bool
+    disconnectedSlot: int
+    disconnectedReason: string
 
 var
   stateLock: Lock
@@ -192,6 +194,51 @@ proc finishEpisode(runtimeConfig: RuntimeConfig) =
   echo "chemistry: episode complete, shutting down"
   quit(0)
 
+proc failEpisode(runtimeConfig: RuntimeConfig, kind, reason: string,
+    seat = -1) =
+  ## Unscored episode failure (startup incomplete, mid-episode disconnect, or
+  ## LLM credentials/transport outage). Emits COGAME_PLAYER_FAILURE_URI and
+  ## exits non-zero WITHOUT writing ordinary scored results.json.
+  var shift = 0
+  withLock stateLock:
+    if state.finished:
+      return
+    state.finished = true
+    shift = state.sim.shift + 1
+    var final = %*{
+      "type": "final",
+      "done": true,
+      "scored": false,
+      "kind": kind,
+      "error": reason,
+      "seat": seat,
+      "shift": shift
+    }
+    for playerSlot, socket in state.playerSockets:
+      final["slot"] = %playerSlot
+      try:
+        socket.send($final)
+      except CatchableError:
+        discard
+  state.trajectory.finishFailedNativeTrajectory(kind, reason, seat, shift)
+  sleep(500)
+  let failureUri = getEnv("COGAME_PLAYER_FAILURE_URI").strip()
+  let payload = %*{
+    "kind": kind,
+    "error": reason,
+    "seat": seat,
+    "shift": shift,
+    "scored": false
+  }
+  echo "chemistry: unscored episode failure (", kind, "): ", reason
+  if failureUri.len > 0:
+    try:
+      writeArtifact(failureUri, $payload, "application/json",
+        "COGAME_PLAYER_FAILURE_METHOD")
+    except CatchableError as err:
+      echo "chemistry: failed to write COGAME_PLAYER_FAILURE_URI: ", err.msg
+  quit(1)
+
 # --------------------------------------------------------------------------
 # The shift loop
 # --------------------------------------------------------------------------
@@ -213,21 +260,19 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
         break
       sleep(200)
 
-    var anyConnected = false
+    var connectedCount = 0
     withLock stateLock:
       state.started = true
-      anyConnected = state.playerSockets.len > 0
-      echo "chemistry: starting with ", state.playerSockets.len, "/",
-        config.numAgents, " players connected"
+      for slot in 0 ..< config.numAgents:
+        if state.playerSockets.hasKey(slot) and state.registered[slot]:
+          inc connectedCount
+      echo "chemistry: starting with ", connectedCount, "/",
+        config.numAgents, " players connected and registered"
 
-    if not anyConnected:
-      ## No seat connected within playerConnectTimeoutSeconds: forfeit, all
-      ## zero, results and the replay are still written.
-      withLock stateLock:
-        echo "chemistry: no player connected; forfeiting"
-        state.sim.stepTick()
-        state.sim.forfeit()
-      finishEpisode(runtimeConfig)
+    if connectedCount < config.numAgents:
+      failEpisode(runtimeConfig, "startup_incomplete",
+        "only " & $connectedCount & "/" & $config.numAgents &
+        " players connected and registered within timeout")
       return
 
     let client = newLlmClient(config)
@@ -251,10 +296,15 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
       var simCopy: Sim
       var prompts: seq[string]
       var scripted: seq[ScriptKind]
+      var disconnectedSlot = -1
+      var disconnectedReason = ""
       withLock stateLock:
-        if state.sim.done:
+        if state.disconnectedSlot >= 0:
+          disconnectedSlot = state.disconnectedSlot
+          disconnectedReason = state.disconnectedReason
+        elif state.sim.done:
           break
-        if epochTime() > playDeadline:
+        elif epochTime() > playDeadline:
           ## The platform kills an episode that outruns its timeout and keeps
           ## nothing at all, so give up shifts rather than the whole result:
           ## stop here, BETWEEN shifts.
@@ -263,22 +313,26 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
           state.sim.endEarly()
           state.broadcastBoardLocked(newJArray())
           break
-        simCopy = state.sim
-        prompts = state.prompts
-        scripted = state.scripted
-        echo "chemistry: shift ", state.sim.shift + 1, " of ", config.shifts,
-          " at ", (epochTime() - gameStart).int, "s"
+        else:
+          simCopy = state.sim
+          prompts = state.prompts
+          scripted = state.scripted
+          echo "chemistry: shift ", state.sim.shift + 1, " of ", config.shifts,
+            " at ", (epochTime() - gameStart).int, "s"
+
+      if disconnectedSlot >= 0:
+        failEpisode(runtimeConfig, "player_disconnected", disconnectedReason,
+          disconnectedSlot)
+        return
 
       ## Send every external seat the same simultaneous shift snapshot before
       ## waiting for any reply. The game still owns observation and legality.
-      var clientScripted = newSeq[ScriptKind](Seats)
-      for slot in 0 ..< Seats:
-        clientScripted[slot] = scripted[slot]
+      var skipLlm = newSeq[bool](Seats)
       withLock stateLock:
         inc state.decisionId
         for slot in 0 ..< Seats:
           if state.external[slot]:
-            clientScripted[slot] = skCourier
+            skipLlm[slot] = true
             state.pending[slot] = true
             state.accepted[slot] = false
             if state.playerSockets.hasKey(slot):
@@ -291,10 +345,10 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
                 "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]
               })
           elif not state.registered[slot]:
-            clientScripted[slot] = skCourier
+            skipLlm[slot] = true
 
-      ## Prompt seats remain one parallel model batch; external seats keep a
-      ## courier order until their own legal reply arrives.
+      ## Prompt seats remain one parallel model batch; external and unregistered
+      ## seats never get a fallback order substituted on their behalf.
       var captureViews: seq[JsonNode]
       if not state.trajectory.isNil:
         # Freeze every simultaneous private view before any action is applied.
@@ -304,7 +358,12 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
             systemPrompt(simCopy, slot), userPrompt(simCopy, slot, prompts[slot]))
           captureViews.add(view)
       let batchStart = epochTime()
-      var orders = client.decideAll(simCopy, prompts, clientScripted)
+      var decisions = client.decideAll(simCopy, prompts, scripted, skipLlm)
+      for slot in 0 ..< Seats:
+        if decisions[slot].infraFailure:
+          failEpisode(runtimeConfig, "llm_infrastructure_error",
+            decisions[slot].error, slot)
+          return
       let deadline = epochTime() + config.llmTimeoutSeconds.float
       while epochTime() < deadline:
         var waiting = false
@@ -321,22 +380,38 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
         for slot in 0 ..< Seats:
           if state.pending[slot]:
             if state.accepted[slot]:
-              orders[slot] = state.actions[slot]
+              decisions[slot] = SeatDecision(
+                hasOrder: true,
+                order: state.actions[slot],
+                status: asAccepted)
             else:
-              orders[slot].source = osFallback
+              decisions[slot] = SeatDecision(
+                hasOrder: false,
+                status: asMissing,
+                error: "external action missing or invalid")
           state.pending[slot] = false
 
       withLock stateLock:
-        ## The `order` events fire from applyOrder, BEFORE the shift's first
-        ## tick, so the broadcast window has to open before them or the live
-        ## feed never shows a standing order at all.
+        ## The `order` / `missed` events fire BEFORE the shift's first tick, so
+        ## the broadcast window has to open before them or the live feed never
+        ## shows them.
         let before = state.sim.events.len
         for slot in 0 ..< Seats:
-          state.sim.applyOrder(slot, orders[slot])
-          if not state.trajectory.isNil:
-            state.trajectory.recordAppliedDecision(config, simCopy.shift, slot,
-              simCopy.policyNames[slot], captureViews[slot],
-              state.sim.cogs[slot].order, client.nativeAttempts[slot])
+          let attempts =
+            if not state.trajectory.isNil and slot < client.nativeAttempts.len:
+              client.nativeAttempts[slot]
+            else: @[]
+          if decisions[slot].hasOrder:
+            state.sim.applyOrder(slot, decisions[slot].order)
+            if not state.trajectory.isNil:
+              state.trajectory.recordAppliedDecision(config, simCopy.shift, slot,
+                simCopy.policyNames[slot], captureViews[slot],
+                state.sim.cogs[slot].order, attempts)
+          else:
+            state.sim.recordMissedTurn(slot, decisions[slot].error)
+            if not state.trajectory.isNil:
+              state.trajectory.recordMissedDecision(config, simCopy.shift, slot,
+                captureViews[slot], attempts, decisions[slot].status)
         state.sim.runShift()
         var events = newJArray()
         for index in before ..< state.sim.events.len:
@@ -408,9 +483,7 @@ proc playerUpgradeHandler(request: Request) {.gcsafe.} =
       state.playerSockets[slot] = websocket
       state.socketSlots[websocket] = slot
       ## The decision layer only calls the LLM for a seat with a live socket;
-      ## every other seat plays `courier` (design: "a seat that never
-      ## connected, or whose socket dies mid-episode, plays courier for every
-      ## remaining shift").
+      ## a disconnected seat misses its turn rather than getting a fallback.
       state.sim.cogs[slot].connected = true
       echo "chemistry: player slot ", slot, " connected (",
         state.playerSockets.len, "/", state.config.numAgents, ")"
@@ -468,10 +541,20 @@ proc websocketHandler(
             prompt = prompt.runeSubStr(0, MaxPromptLen)
           let node = payload{"scripted"}
           let scripted =
-            if node.isNil: skNone
-            elif node.kind == JBool:
-              (if node.getBool(): skCourier else: skNone)
-            else: parseScriptKind(node.getStr())
+            if node.isNil or node.kind == JNull:
+              skNone
+            elif node.kind != JString:
+              raise newException(ChemistryError, "scripted must be a string")
+            else:
+              let text = node.getStr().strip()
+              if text.len == 0:
+                skNone
+              else:
+                let parsed = parseScriptKind(text)
+                if parsed == skNone:
+                  raise newException(ChemistryError,
+                    "unknown scripted policy: " & text)
+                parsed
           withLock stateLock:
             state.prompts[slot] = prompt
             state.scripted[slot] = scripted
@@ -515,11 +598,13 @@ proc websocketHandler(
           state.socketSlots.del(websocket)
           if state.playerSockets.getOrDefault(slot) == websocket:
             state.playerSockets.del(slot)
-            ## The socket died mid-episode: this seat plays `courier` from
-            ## here on rather than being prompted with nobody listening.
             state.sim.cogs[slot].connected = false
-            echo "chemistry: player slot ", slot,
-              " disconnected; playing courier for the rest of the episode"
+            if state.started and not state.finished and not state.sim.done and
+                state.disconnectedSlot < 0:
+              state.disconnectedSlot = slot
+              state.disconnectedReason =
+                "player slot " & $slot & " disconnected mid-episode"
+            echo "chemistry: player slot ", slot, " disconnected"
         state.globalSockets.excl(websocket)
         state.viewers.del(websocket)
 
@@ -544,6 +629,7 @@ proc runGameServer*(config: GameConfig, runtimeConfig: RuntimeConfig) =
   state.pending = newSeq[bool](Seats)
   state.accepted = newSeq[bool](Seats)
   state.actions = newSeq[Order](Seats)
+  state.disconnectedSlot = -1
   let router = buildRouter()
   gameServer = newServer(router, websocketHandler)
   createThread(gameThread, runGame, runtimeConfig)

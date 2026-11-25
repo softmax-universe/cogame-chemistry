@@ -26,7 +26,7 @@ for variant in (
         manifest = json.loads((output / "manifest.json").read_text())
         assert (
             manifest["source_revision"] == revision
-            and manifest["prompt_bank"] == "chemistry-rules-v1"
+            and manifest["prompt_bank"] == "chemistry-rules-v2"
         )
         runs = {run["episode"]: run for run in manifest["runs"]}
         assert len(runs) == 10

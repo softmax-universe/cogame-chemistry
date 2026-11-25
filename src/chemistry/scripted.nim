@@ -26,11 +26,11 @@ type
                      ## beryl-brine, cobalt-resin, cobalt-brine
 
 proc parseScriptKind*(text: string): ScriptKind =
-  ## PLAYER_SCRIPTED values. "1"/"true"/"yes"/"courier" play the working
-  ## baseline; "freeloader"/"shirker" play the shirker; anything else nothing.
+  ## PLAYER_SCRIPTED values: canonical "courier" or "freeloader"; anything else
+  ## leaves the seat unscripted.
   case text.strip().toLowerAscii()
-  of "1", "true", "yes", "courier": skCourier
-  of "freeloader", "shirker", "forager": skFreeloader
+  of "courier": skCourier
+  of "freeloader": skFreeloader
   else: skNone
 
 proc titleCase(text: string): string =
@@ -128,5 +128,7 @@ proc freeloaderOrder*(sim: Sim, slot: int): Order =
 
 proc scriptedOrder*(sim: Sim, slot: int, kind: ScriptKind): Order =
   case kind
+  of skCourier: sim.courierOrder(slot)
   of skFreeloader: sim.freeloaderOrder(slot)
-  else: sim.courierOrder(slot)
+  of skNone:
+    raise newException(ChemistryError, "no scripted policy selected")

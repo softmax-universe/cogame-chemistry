@@ -106,7 +106,7 @@
       return {
         t: tick, k: 'order', seat: slot, shift: 4,
         job: 'supply', sp: SPECIES[slot % 3], rx: CYCLES[slot % 3],
-        source: slot % 3 === 0 ? 'llm' : 'fallback', clamped: false,
+        source: slot % 3 === 0 ? 'llm' : 'scripted', clamped: false,
         say: SAY, notes: NOTES, latencyMs: 900
       };
     });

@@ -1,6 +1,6 @@
 ## Sim units: the nine numbered steps, each precondition, and determinism.
 
-import std/[strutils, unicode, unittest]
+import std/[json, strutils, unicode, unittest]
 import chemistry/sim
 
 proc idleSim(cycles = 3, distractorPeriod = 0): Sim =
@@ -363,3 +363,37 @@ suite "rune-safe truncation":
     check errorText(long).runeLen <= MaxErrorLen
     ## Newlines in `say` become spaces.
     check "\n" notin sayText("a\nb")
+
+suite "missed turns and strict order validation":
+  test "applyOrder rejects invalid orders without coercion":
+    var sim = idleSim(2, 0)
+    expect ChemistryError:
+      sim.applyOrder(0, Order(job: jobSupply, molecule: spResin,
+        hasMolecule: true, reactor: rxCobalt, hasReactor: true))
+    expect ChemistryError:
+      sim.applyOrder(0, Order(job: jobSupply, molecule: spGlitter,
+        hasMolecule: true, reactor: rxAmber, hasReactor: true))
+    check sim.countEvents(evOrder) == 0
+
+  test "recordMissedTurn advances time without executing an order":
+    var sim = idleSim(3, 0)
+    sim.cogs[0].cell = Cell(x: 6, y: 6)
+    sim.placeMolecule(Cell(x: 6, y: 6), spResin)
+    sim.applyOrder(0, Order(job: jobSupply, molecule: spResin,
+      hasMolecule: true, reactor: rxAmber, hasReactor: true))
+    sim.recordMissedTurn(0, "model response invalid")
+    check not sim.cogs[0].hasOrder
+    check sim.cogs[0].missedTurn
+    check sim.cogs[0].missedTurns == 1
+    check sim.countEvents(evMissed) == 1
+    let startCell = sim.cogs[0].cell
+    sim.runShift()
+    check sim.cogs[0].cell == startCell
+    check not sim.cogs[0].hasCarry
+    check sim.resultsJson()["missed_turns"][0].getInt() == 1
+
+  test "parseScriptKind accepts only canonical courier and freeloader":
+    check parseScriptKind("courier") == skCourier
+    check parseScriptKind("freeloader") == skFreeloader
+    for legacy in ["1", "true", "yes", "shirker", "forager", ""]:
+      check parseScriptKind(legacy) == skNone

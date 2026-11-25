@@ -76,16 +76,11 @@ proc recordAppliedDecision*(trajectory: DecisionTrajectory, config: GameConfig,
   var attempts = evidence
   var selected = none(string)
   var status = asAccepted
-  var fallback = none(string)
   case order.source
   of osLlm, osRetry:
     doAssert attempts.len > 0 and attempts[^1].parsedAction == action
     if attempts[^1].accepted: selected = some(attempts[^1].attemptId)
     else: status = asRejected
-  of osFallback:
-    status = asFallback
-    fallback = some("engine-courier")
-    for attempt in attempts.mitems: attempt.accepted = false
   of osScripted, osExternal:
     # Existing scripted/external actions have no authenticated model evidence.
     # Preserve execution without granting them teacher or model authority.
@@ -104,7 +99,29 @@ proc recordAppliedDecision*(trajectory: DecisionTrajectory, config: GameConfig,
           attempt.request["system"].getStr(),
           attempt.request["messages"][0]["content"].getStr())})
   trajectory.recordDecision($shift & "-" & $seat, $seat, view,
-    attempts, selected, action, status, fallbackOrigin = fallback)
+    attempts, selected, action, status)
+
+proc recordMissedDecision*(trajectory: DecisionTrajectory, config: GameConfig,
+    shift, seat: int, observation: JsonNode, evidence: seq[DecisionAttempt],
+    status: ActionStatus = asMissing) =
+  if trajectory.isNil: return
+  var attempts = evidence
+  for attempt in attempts.mitems:
+    attempt.accepted = false
+  let finalStatus =
+    if status in {asRejected, asMissing}: status
+    elif attempts.len > 0: asRejected
+    else: asMissing
+  var view = copy(observation)
+  view["prompt_attempts"] = newJArray()
+  for attempt in attempts:
+    if attempt.origin == aoModel:
+      view["prompt_attempts"].add(%*{"attempt_id": attempt.attemptId,
+        "prompt_template": promptMetadata(config,
+          attempt.request["system"].getStr(),
+          attempt.request["messages"][0]["content"].getStr())})
+  trajectory.recordDecision($shift & "-" & $seat, $seat, view,
+    attempts, none(string), newJNull(), finalStatus)
 
 proc finishNativeTrajectory*(trajectory: DecisionTrajectory, game: Sim) =
   if trajectory.isNil: return
@@ -113,4 +130,17 @@ proc finishNativeTrajectory*(trajectory: DecisionTrajectory, game: Sim) =
   for seat in 0 ..< Seats: scores[$seat] = outcome["scores"][seat]
   trajectory.finish(if outcome["reason"].getStr() == "complete": esCompleted else: esTruncated,
     outcome, scores)
+  trajectory.writeEventsToUri(getEnv(CogameSaveTrajectoryUriEnv))
+
+proc finishFailedNativeTrajectory*(trajectory: DecisionTrajectory, kind,
+    reason: string, seat, shift: int) =
+  if trajectory.isNil: return
+  let outcome = %*{
+    "kind": kind,
+    "error": reason,
+    "seat": seat,
+    "shift": shift,
+    "scored": false
+  }
+  trajectory.finish(esFailed, outcome, newJObject())
   trajectory.writeEventsToUri(getEnv(CogameSaveTrajectoryUriEnv))
