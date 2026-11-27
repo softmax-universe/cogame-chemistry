@@ -761,11 +761,6 @@ proc decideAll*(
         var order = sim.parseDecision(payload)
         if capture:
           evidence.parsedAction = order.orderAction()
-          evidence.accepted = not order.clamped and
-            payload{"say"}.getStr() == order.say and
-            payload{"notes"}.getStr() == order.notes
-          if not evidence.accepted:
-            evidence.rejectionReason = some("native parser clamped or shortened supplied fields")
         order.source = (if attempt == 0: osLlm else: osRetry)
         order.latencyMs = latencyMs
         result[slot] = SeatDecision(

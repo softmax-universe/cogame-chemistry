@@ -71,9 +71,18 @@ Without the private upload URI no trajectory is created.
 
 Every retry retains its actual request, generated response, received body,
 platform call ID, decoder fields and per-attempt prompt hashes. Supplied text
-never becomes a generated label. Responses whose native parser clamps reactor
-choices or shortens speech/notes remain evidence but have no selected model
-label. Existing scripted and unqualified external actions retain unknown origin;
+never becomes a generated label. When the game applies an order, the trace selects the attempt that supplied
+it. The original generated text stays in `response`. The selected
+`parsed_action` equals `executed_action`, including the speech and private
+notes actually stored after their length limits. Invalid replies retain their
+errors. An exhausted retry has no selected attempt or executed action.
+
+For datasets requiring unchanged speech and notes, compare the supplied
+`say` and `notes` strings in the model's response against the corresponding
+`parsed_action` fields (omitted text defaults to the empty string). Include
+only matching attempt IDs in the dataset's `admitted_attempts` selection.
+
+Existing scripted and unqualified external actions retain unknown origin;
 they are not relabeled as model demonstrations or reviewed teachers. Deadline
 endings are truncated rather than completed training episodes.
 

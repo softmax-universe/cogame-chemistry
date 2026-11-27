@@ -74,22 +74,17 @@ proc recordAppliedDecision*(trajectory: DecisionTrajectory, config: GameConfig,
   if trajectory.isNil: return
   let action = order.orderAction()
   var attempts = evidence
-  var selected = none(string)
-  var status = asAccepted
   case order.source
   of osLlm, osRetry:
     doAssert attempts.len > 0 and attempts[^1].parsedAction == action
-    if attempts[^1].accepted: selected = some(attempts[^1].attemptId)
-    else: status = asRejected
   of osScripted, osExternal:
     # Existing scripted/external actions have no authenticated model evidence.
     # Preserve execution without granting them teacher or model authority.
     var attempt = newDecisionAttempt($shift & "-" & $seat & "-unknown",
       policy, aoUnknown)
     attempt.parsedAction = action
-    attempt.accepted = true
     attempts.add(attempt)
-    selected = some(attempt.attemptId)
+  attempts[^1].accepted = true
   var view = copy(observation)
   view["prompt_attempts"] = newJArray()
   for attempt in attempts:
@@ -99,7 +94,7 @@ proc recordAppliedDecision*(trajectory: DecisionTrajectory, config: GameConfig,
           attempt.request["system"].getStr(),
           attempt.request["messages"][0]["content"].getStr())})
   trajectory.recordDecision($shift & "-" & $seat, $seat, view,
-    attempts, selected, action, status)
+    attempts, some(attempts[^1].attemptId), action, asAccepted)
 
 proc recordMissedDecision*(trajectory: DecisionTrajectory, config: GameConfig,
     shift, seat: int, observation: JsonNode, evidence: seq[DecisionAttempt],
