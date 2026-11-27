@@ -89,9 +89,24 @@ proc run(variant, destination: string, seed = 42): JsonNode =
     doAssert rejected["executed_action"].kind == JNull
     doAssert rejected["fallback_origin"].kind == JNull
     doAssert rejected["attempts"].len == 2
+    for failed in rejected["attempts"]:
+      doAssert not failed["accepted"].getBool()
+      doAssert failed["parsed_action"].kind == JNull
+      doAssert failed["rejection_reason"].getStr().len > 0
     let normalized = parseJson(lines[2 * Seats])
-    doAssert normalized["action_status"].getStr() == "rejected"
-    doAssert normalized["selected_attempt_id"].kind == JNull
+    doAssert normalized["action_status"].getStr() == "accepted"
+    doAssert normalized["attempts"].len == 1
+    let selected = normalized["attempts"][0]
+    doAssert normalized["selected_attempt_id"] == selected["attempt_id"]
+    doAssert selected["accepted"].getBool() and selected["rejection_reason"].kind == JNull
+    let sent = parseJson(selected["response"].getStr())
+    let applied = normalized["executed_action"]
+    doAssert selected["parsed_action"] == applied
+    for key in ["job", "molecule", "reactor"]: doAssert sent[key] == applied[key]
+    doAssert sent["notes"].getStr() == repeat('n', 404)
+    doAssert applied["notes"].getStr() == repeat('n', MaxNotesLen - 1) & "…"
+    doAssert sent["say"].getStr() == repeat('x', 90)
+    doAssert applied["say"].getStr() == repeat('x', MaxSayLen - 1) & "…"
     let last = parseJson(lines[^1])
     doAssert last["status"].getStr() == "completed"
     doAssert last["outcome"] == result

@@ -22,7 +22,7 @@ class Provider(BaseHTTPRequestHandler):
             text = "invalid reply"
         elif shift == 3:
             text = json.dumps(
-                {"job": "forage", "reactor": "cobalt", "say": "x" * 500, "notes": "PRIVATE_CAPTURE_SENTINEL"}
+                {"job": "supply", "molecule": "resin", "reactor": "amber", "say": "x" * 90, "notes": "n" * 404}
             )
         else:
             text = json.dumps({"job": "forage", "say": "work", "notes": "PRIVATE_CAPTURE_SENTINEL"})
